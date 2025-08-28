@@ -1,0 +1,40 @@
+{
+  "name": "my-shop",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently npm:dev:*",
+    "dev:server": "ts-node ./src/index.ts",
+    "dev:worker": "ts-node ./src/index-worker.ts",
+    "build": "tsc && concurrently npm:build:*",
+    "build:server": "tsc",
+    "build:admin-ui": "ts-node src/ui-extensions/admin-ui-extension.ts",
+    "start": "node ./dist/index.js",
+    "start:worker": "node ./dist/index-worker.js",
+    "migration:generate": "ts-node migration generate",
+    "migration:run": "ts-node migration run",
+    "migration:revert": "ts-node migration revert"
+  },
+  "dependencies": {
+    "@vendure/admin-ui-plugin": "^3.4.1",
+    "@vendure/asset-server-plugin": "^3.4.1",
+    "@vendure/common": "^3.4.1",
+    "@vendure/core": "^3.4.1",
+    "@vendure/email-plugin": "^3.4.1",
+    "@vendure/graphiql-plugin": "^3.4.1",
+    "@aws-sdk/client-cognito-identity-provider": "^3.876.0",
+    "dotenv": "^16.6.1",
+    "graphql": "^16.10.0",
+    "graphql-tag": "^2.12.6",
+    "pg": "^8.16.3",
+    "typescript": "^5.3.3"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.23",
+    "@types/node": "^24.3.0",
+    "@vendure/cli": "^3.4.1",
+    "@vendure/ui-devkit": "^3.4.1",
+    "concurrently": "^9.2.1",
+    "ts-node": "^10.9.2"
+  }
+}
