@@ -4,11 +4,15 @@ import {
     DefaultSchedulerPlugin,
     DefaultSearchPlugin,
     VendureConfig,
+    LogLevel,
+    DefaultLogger,
 } from '@vendure/core';
 import { defaultEmailHandlers, EmailPlugin, FileBasedTemplateLoader } from '@vendure/email-plugin';
 import { AssetServerPlugin } from '@vendure/asset-server-plugin';
 import { AdminUiPlugin } from '@vendure/admin-ui-plugin';
 import { GraphiqlPlugin } from '@vendure/graphiql-plugin';
+import { Request, Response, NextFunction } from 'express';
+import { CognitoAuthPlugin } from './auth/cognito-auth-plugin';
 import 'dotenv/config';
 import path from 'path';
 
@@ -21,13 +25,21 @@ export const config: VendureConfig = {
         adminApiPath: 'admin-api',
         shopApiPath: 'shop-api',
         trustProxy: IS_DEV ? false : 1,
-        // The following options are useful in development mode,
-        // but are best turned off for production for security
-        // reasons.
         ...(IS_DEV ? {
             adminApiDebug: true,
             shopApiDebug: true,
         } : {}),
+        middleware: [
+            {
+                handler: (req: Request, res: Response, next: NextFunction) => {
+                    if (req.path.startsWith('/cognito')) {
+                        return next();
+                    }
+                    return next();
+                },
+                route: '*',
+            },
+        ],
     },
     authOptions: {
         tokenMethod: ['bearer', 'cookie'],
@@ -38,11 +50,10 @@ export const config: VendureConfig = {
         cookieOptions: {
           secret: process.env.COOKIE_SECRET,
         },
+        requireVerification: false,
     },
     dbConnectionOptions: {
         type: 'postgres',
-        // See the README.md "Migrations" section for an explanation of
-        // the `synchronize` and `migrations` options.
         synchronize: false,
         migrations: [path.join(__dirname, './migrations/*.+(js|ts)')],
         logging: false,
@@ -56,17 +67,19 @@ export const config: VendureConfig = {
     paymentOptions: {
         paymentMethodHandlers: [dummyPaymentHandler],
     },
-    // When adding or altering custom field definitions, the database will
-    // need to be updated. See the "Migrations" section in README.md.
     customFields: {},
+    // Fix the logger configuration to match the expected format
+    logger: new DefaultLogger({
+  level: LogLevel.Debug,
+  timestamp: true,
+}),
+
     plugins: [
+        CognitoAuthPlugin,
         GraphiqlPlugin.init(),
         AssetServerPlugin.init({
             route: 'assets',
             assetUploadDir: path.join(__dirname, '../static/assets'),
-            // For local dev, the correct value for assetUrlPrefix should
-            // be guessed correctly, but for production it will usually need
-            // to be set manually to match your production url.
             assetUrlPrefix: IS_DEV ? undefined : 'https://www.my-shop.com/assets/',
         }),
         DefaultSchedulerPlugin.init(),
@@ -79,8 +92,6 @@ export const config: VendureConfig = {
             handlers: defaultEmailHandlers,
             templateLoader: new FileBasedTemplateLoader(path.join(__dirname, '../static/email/templates')),
             globalTemplateVars: {
-                // The following variables will change depending on your storefront implementation.
-                // Here we are assuming a storefront running at http://localhost:8080.
                 fromAddress: '"example" <noreply@example.com>',
                 verifyEmailAddressUrl: 'http://localhost:8080/verify',
                 passwordResetUrl: 'http://localhost:8080/password-reset',
