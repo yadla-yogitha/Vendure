@@ -788,9 +788,9 @@ export class CognitoAuthStrategy implements AuthenticationStrategy<any> {
     if (adminResult.length === 0) {
       Logger.info(`Creating Administrator entity for user ${user.id}`, 'CognitoAuthStrategy');
       await this.connection.rawConnection.query(
-        `INSERT INTO administrator ("userId", "emailAddress", "passwordHash")
-         VALUES ($1, $2, $3)`,
-        [user.id, email, 'cognito-external'] // passwordHash is a dummy value, not used for external auth
+        `INSERT INTO administrator ("userId", "emailAddress", "firstName", "lastName")
+         VALUES ($1, $2, $3, $4)`,
+        [user.id, email, 'Cognito', 'User'] // Added firstName and lastName with default values
       );
     }
   }
