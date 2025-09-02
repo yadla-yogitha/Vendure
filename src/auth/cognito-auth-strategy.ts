@@ -10,6 +10,9 @@ import {
   TransactionalConnection,
   Logger,
   RequestContextService,
+  LanguageCode,
+  CurrencyCode,
+  Channel,
 } from '@vendure/core';
 import { Injectable } from '@nestjs/common';
 import { DocumentNode } from 'graphql';
@@ -533,11 +536,26 @@ export class CognitoAuthStrategy implements AuthenticationStrategy<any> {
         const user = await this.findOrCreateUser(ctx, externalIdentifier, email, firstName, lastName);
         Logger.info(`User found/created with ID: ${user.id}`, 'CognitoAuthStrategy');
 
-        Logger.info(`Creating session for user ${user.id}`, 'CognitoAuthStrategy');
+        // --- NEW: Ensure administrator entity exists and fetch it ---
+        const adminResult = await this.connection.rawConnection.query(
+          `SELECT * FROM administrator WHERE "userId" = $1`,
+          [user.id]
+        );
+        let administrator = adminResult[0];
+        if (!administrator) {
+          Logger.error(`Administrator entity not found for user ${user.id}`, 'CognitoAuthStrategy');
+          return response.redirect('/admin?authError=' + encodeURIComponent('No administrator entity found for user'));
+        }
+        Logger.info(`Administrator entity found for user ${user.id}: ${JSON.stringify(administrator)}`, 'CognitoAuthStrategy');
+
+        // --- NEW: Use administrator entity for session creation ---
+        Logger.info(`Creating session for administrator ${administrator.id} (userId: ${user.id})`, 'CognitoAuthStrategy');
         try {
           const session = await this.requestContextService.create({
             apiType: 'admin',
             user,
+            // Optionally, you can add administratorId if your session logic supports it
+            // administratorId: administrator.id,
           });
           Logger.info(`Session created successfully: ${session ? 'yes' : 'no'}`, 'CognitoAuthStrategy');
 
@@ -609,25 +627,51 @@ export class CognitoAuthStrategy implements AuthenticationStrategy<any> {
       Logger.error(error, 'CognitoAuthStrategy');
       return callback(new Error(error));
     }
-    
+
     Logger.info(`Getting signing key for kid: ${header.kid}`, 'CognitoAuthStrategy');
-    
-    this.jwksClient.getSigningKey(header.kid, function (err: Error | null, key: any) {
-      if (err) {
-        Logger.error(`Error getting signing key: ${err.message}`, 'CognitoAuthStrategy');
-        return callback(err);
-      }
-      
-      if (!key) {
-        const error = 'Signing key not found';
-        Logger.error(error, 'CognitoAuthStrategy');
-        return callback(new Error(error));
-      }
-      
-      Logger.info(`Signing key found for kid: ${header.kid}`, 'CognitoAuthStrategy');
-      const signingKey = typeof key.getPublicKey === 'function' ? key.getPublicKey() : key.rsaPublicKey;
-      callback(null, signingKey);
-    });
+
+    // Add a timeout and retry logic for JWKS key retrieval to avoid ETIMEDOUT errors
+    const tryGetSigningKey = (retries = 2) => {
+      this.jwksClient.getSigningKey(header.kid, (err: Error | null, key: any) => {
+        if (err) {
+          Logger.error(`Error getting signing key: ${err.message || JSON.stringify(err)}`, 'CognitoAuthStrategy');
+          if (err['code'] === 'ETIMEDOUT' && retries > 0) {
+            Logger.warn(`JWKS key fetch timed out, retrying... (${retries} retries left)`, 'CognitoAuthStrategy');
+            setTimeout(() => tryGetSigningKey(retries - 1), 1000);
+            return;
+          }
+          return callback(err);
+        }
+        if (!key) {
+          const error = 'Signing key not found';
+          Logger.error(error, 'CognitoAuthStrategy');
+          return callback(new Error(error));
+        }
+
+        Logger.info(`JWKS key object: ${JSON.stringify(key)}`, 'CognitoAuthStrategy');
+
+        let signingKey: string | Buffer | undefined;
+        if (typeof key.getPublicKey === 'function') {
+          signingKey = key.getPublicKey();
+        } else if (key.publicKey) {
+          signingKey = key.publicKey;
+        } else if (key.rsaPublicKey) {
+          signingKey = key.rsaPublicKey;
+        } else if (typeof key === 'string') {
+          signingKey = key;
+        }
+
+        if (!signingKey) {
+          Logger.error('Unable to extract public key from JWKS key object', 'CognitoAuthStrategy');
+          return callback(new Error('Unable to extract public key from JWKS key object'));
+        }
+
+        Logger.info(`Signing key found for kid: ${header.kid}`, 'CognitoAuthStrategy');
+        callback(null, signingKey);
+      });
+    };
+
+    tryGetSigningKey();
   }
 
   private async findOrCreateUser(
@@ -642,30 +686,8 @@ export class CognitoAuthStrategy implements AuthenticationStrategy<any> {
       const existing = await this.externalAuthenticationService.findCustomerUser(ctx, this.name, externalIdentifier);
       if (existing) {
         Logger.info(`Found existing user with ID: ${existing.id}`, 'CognitoAuthStrategy');
-        
-        // Check if the existing user has admin permissions
-        if (!existing.roles || !existing.roles.some(role => role.code === 'administrator' || role.code === 'super-admin')) {
-          Logger.info('Existing user lacks admin role, attempting to add it...', 'CognitoAuthStrategy');
-          try {
-            // Use the connection to directly update the user_roles table
-            await this.connection.rawConnection.query(
-              `INSERT INTO user_roles_role (userId, roleId) 
-               SELECT $1, id FROM role WHERE code = 'super-admin'
-               ON CONFLICT DO NOTHING`,
-              [existing.id]
-            );
-            Logger.info(`Added SuperAdmin role to existing user ${existing.id}`, 'CognitoAuthStrategy');
-            
-            // Refresh the user to get the updated roles
-            const updatedUser = await this.userService.getUserByEmailAddress(ctx, email);
-            if (updatedUser) {
-              return updatedUser;
-            }
-          } catch (e) {
-            Logger.error(`Failed to update user roles: ${e instanceof Error ? e.message : String(e)}`, 'CognitoAuthStrategy');
-          }
-        }
-        
+        // Pass firstName/lastName to ensureUserChannel for administrator creation
+        await this.ensureUserChannel(ctx, existing, email, firstName, lastName);
         return existing;
       }
     } catch (e) {
@@ -674,9 +696,7 @@ export class CognitoAuthStrategy implements AuthenticationStrategy<any> {
     }
 
     Logger.info(`Creating new user for external ID: ${externalIdentifier}, email: ${email}`, 'CognitoAuthStrategy');
-    
     try {
-      // Create user with proper role that has channels
       const newUser = await this.externalAuthenticationService.createCustomerAndUser(ctx, {
         strategy: this.name,
         externalIdentifier,
@@ -685,37 +705,93 @@ export class CognitoAuthStrategy implements AuthenticationStrategy<any> {
         lastName,
         verified: true,
       });
-      
       Logger.info(`Created new user with ID: ${newUser.id}`, 'CognitoAuthStrategy');
-      
-      // Explicitly assign SuperAdmin role to the new user
-      try {
-        Logger.info('Assigning SuperAdmin role to newly created user...', 'CognitoAuthStrategy');
-        await this.connection.rawConnection.query(
-          `INSERT INTO user_roles_role (userId, roleId) 
-           SELECT $1, id FROM role WHERE code = 'super-admin'
-           ON CONFLICT DO NOTHING`,
-          [newUser.id]
-        );
-        Logger.info(`SuperAdmin role assigned to user ${newUser.id}`, 'CognitoAuthStrategy');
-        
-        // Get the updated user with proper roles
-        const adminUser = await this.userService.getUserByEmailAddress(ctx, email);
-        if (adminUser) {
-          Logger.info(`Retrieved user with roles: ${JSON.stringify({
-            id: adminUser.id,
-            roles: adminUser.roles?.map(r => ({ id: r.id, code: r.code }))
-          })}`, 'CognitoAuthStrategy');
-          return adminUser;
-        }
-      } catch (roleErr) {
-        Logger.error(`Failed to assign SuperAdmin role: ${roleErr instanceof Error ? roleErr.message : String(roleErr)}`, 'CognitoAuthStrategy');
-      }
-      
+      // Pass firstName/lastName to ensureUserChannel for administrator creation
+      await this.ensureUserChannel(ctx, newUser, email, firstName, lastName);
       return newUser;
     } catch (error) {
       Logger.error(`Error creating user: ${error instanceof Error ? error.message : String(error)}`, 'CognitoAuthStrategy');
       throw error;
+    }
+  }
+
+  // Create a dedicated channel for the user if not exists, assign user and super-admin role to it
+  private async ensureUserChannel(
+    ctx: RequestContext,
+    user: User,
+    email: string,
+    _firstName?: string, // unused
+    _lastName?: string   // unused
+  ) {
+    const channelCode = `user-${user.id}`;
+    const channelToken = `user-${user.id}-token`;
+
+    // Check if channel exists
+    let userChannel = await this.channelService.getChannelFromToken(channelToken);
+    if (!userChannel) {
+      Logger.info(`Creating new channel for user ${user.id} (${email})`, 'CognitoAuthStrategy');
+      const createResult = await this.channelService.create(ctx, {
+        code: channelCode,
+        token: channelToken,
+        defaultLanguageCode: LanguageCode.en,
+        pricesIncludeTax: false,
+        currencyCode: CurrencyCode.USD,
+        defaultShippingZoneId: undefined,
+        defaultTaxZoneId: undefined,
+      });
+      if ('id' in createResult) {
+        userChannel = createResult;
+        Logger.info(`Created channel ${userChannel.id} for user ${user.id}`, 'CognitoAuthStrategy');
+      } else {
+        Logger.error(`Failed to create channel for user ${user.id}: ${JSON.stringify(createResult)}`, 'CognitoAuthStrategy');
+        throw new Error('Failed to create channel for user');
+      }
+    } else {
+      Logger.info(`Channel already exists for user ${user.id}: ${userChannel.id}`, 'CognitoAuthStrategy');
+    }
+
+    // There is no administrator_channels_channel table in your schema.
+    // Vendure core only supports channel membership for customers (customer_channels_channel).
+    // For admin users, channel membership is implicit via their roles and permissions.
+
+    // So, skip explicit channel membership for admin users.
+    // Only assign roles and role-channel mapping.
+
+    // Assign super-admin role to user (user_roles_role table)
+    await this.connection.rawConnection.query(
+      `INSERT INTO user_roles_role ("userId", "roleId")
+       SELECT $1, id FROM role WHERE code = 'super-admin'
+       AND id NOT IN (
+         SELECT "roleId" FROM user_roles_role WHERE "userId" = $1
+       )`,
+      [user.id]
+    );
+
+    // Assign the super-admin role to the channel (role_channels_channel table)
+    await this.connection.rawConnection.query(
+      `INSERT INTO role_channels_channel ("roleId", "channelId")
+       SELECT id, $1 FROM role WHERE code = 'super-admin'
+       AND NOT EXISTS (
+         SELECT 1 FROM role_channels_channel WHERE "roleId" = id AND "channelId" = $1
+       )`,
+      [userChannel.id]
+    );
+
+    // --- Ensure the user is an Administrator entity and linked to the User ---
+    // Vendure permissions require an Administrator entity for admin API access.
+    // Only store email and a dummy password, do not use firstName/lastName.
+
+    const adminResult = await this.connection.rawConnection.query(
+      `SELECT * FROM administrator WHERE "userId" = $1`,
+      [user.id]
+    );
+    if (adminResult.length === 0) {
+      Logger.info(`Creating Administrator entity for user ${user.id}`, 'CognitoAuthStrategy');
+      await this.connection.rawConnection.query(
+        `INSERT INTO administrator ("userId", "emailAddress", "passwordHash")
+         VALUES ($1, $2, $3)`,
+        [user.id, email, 'cognito-external'] // passwordHash is a dummy value, not used for external auth
+      );
     }
   }
 }
